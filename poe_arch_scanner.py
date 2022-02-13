@@ -3,8 +3,10 @@ from dataclasses import dataclass
 from configparser import ConfigParser
 
 import win32gui
+from win32clipboard import *
 
 import tkinter as tk
+from tkinter import messagebox
 from typing import Callable, Any, Tuple, List, Dict
 
 import cv2
@@ -145,7 +147,7 @@ class ArchnemesisItemsMap:
             if recipe:
                 yield (item, recipe)
 
-    def get_subtree_for(self, item):
+    def get_subtree_for(self, item: str):
         tree = RecipeItemNode(item, [])
         nodes = [tree]
         while len(nodes) > 0:
@@ -155,6 +157,13 @@ class ArchnemesisItemsMap:
                 node.components = [RecipeItemNode(c, []) for c in children]
                 nodes.extend(node.components)
         return tree
+
+    def get_parent_recipes_for(self, item: str) -> []:
+        parents = list()
+        for parent, components in self._arch_items:
+            if item in components:
+                parents.append(parent)
+        return parents
 
     def _get_item_components(self, item) -> List[str]:
         return next(l for x, l in self._arch_items if x == item)
@@ -258,6 +267,7 @@ class UIOverlay:
         self._root = root
         self._scan_results_window = None
         self._recipe_browser_window = None
+        self._recipe_browser_current_root = ''
         self._tooltip_window = None
         self._highlight_windows_to_show = list()
         self._scan_results_window_saved_position = (-1, 0)
@@ -269,6 +279,7 @@ class UIOverlay:
         self._root.overrideredirect(True)
         self._root.geometry(f'+{info.x + 5}+{info.y + info.title_bar_height + 5}')
         self._root.wm_attributes('-topmost', True)
+        self._root.deiconify()
 
     @staticmethod
     def create_toplevel_window(bg=''):
@@ -392,10 +403,18 @@ class UIOverlay:
     def _show_recipe_browser_tree(self, item: str, results: Dict[str, List[Tuple[int, int]]]) -> None:
         if self._recipe_browser_window is not None:
             self._recipe_browser_window.destroy()
+        self._destroy_tooltip_and_clear_highlights(None)
+        # If the user clicks on the current root then close the tree
+        if self._recipe_browser_current_root == item:
+            return
+        self._recipe_browser_current_root = item
         self._recipe_browser_window = UIOverlay.create_toplevel_window()
-        self._recipe_browser_window.geometry(f'+{self._scan_results_window.winfo_x()}+{self._scan_results_window.winfo_y() + self._scan_results_window.winfo_height() + 20}')
+        self._recipe_browser_window.geometry(f'+{self._scan_results_window.winfo_x()}+{self._scan_results_window.winfo_y() + self._scan_results_window.winfo_height() + 40}')
 
         tree = self._items_map.get_subtree_for(item)
+        if self._settings.should_copy_recipe_to_clipboard():
+            self._copy_tree_items_to_clipboard(tree)
+
         def draw_tree(node, row, column):
             children_column = column
             for c in node.components:
@@ -415,9 +434,16 @@ class UIOverlay:
                 f = tk.Frame(self._recipe_browser_window, bg=COLOR_BG, width=(self._items_map.small_image_size + 4) * columnspan, height=3)
                 f.grid(row=row + 1, column=column, columnspan=columnspan)
             return children_column + 1
-        total_columns = draw_tree(tree, 0, 0)
+        total_columns = draw_tree(tree, 1, 0)
         for c in range(total_columns):
             self._recipe_browser_window.grid_columnconfigure(c, minsize=self._items_map.small_image_size)
+        # Show parents on row 0
+        parents = [RecipeItemNode(p, []) for p in self._items_map.get_parent_recipes_for(item)]
+        if len(parents) > 0:
+            tk.Label(self._recipe_browser_window, text='Used in:', bg=COLOR_BG, fg=COLOR_FG_GREEN, font=FONT_BIG).grid(row=0, column=0)
+            for column, p in enumerate(parents):
+                # Reuse the same function for convenience
+                draw_tree(p, 0, column + 1)
 
     def _highlight_items_in_inventory(self, inventory_items: List[Tuple[int, int]], color: str) -> None:
         self._highlight_windows_to_show = list()
@@ -439,11 +465,22 @@ class UIOverlay:
         if self._tooltip_window is not None:
             self._tooltip_window.destroy()
         self._tooltip_window = UIOverlay.create_toplevel_window()
-        self._tooltip_window.geometry(f'+{window.winfo_x()}+{window.winfo_y() - 20}')
+        self._tooltip_window.geometry(f'+{window.winfo_x()}+{window.winfo_y() - 40}')
         tk.Label(self._tooltip_window, text=text, font=FONT_BIG, bg=COLOR_BG, fg=COLOR_FG_GREEN).pack()
 
         if inventory_items is not None:
             self._highlight_items_in_inventory(inventory_items, COLOR_FG_GREEN)
+
+    def _copy_tree_items_to_clipboard(self, tree):
+        if len(tree.components) > 0:
+            search_string = '|'.join((str(x.item) for x in tree.components))
+        else:
+            search_string = tree.item
+
+        OpenClipboard()
+        EmptyClipboard()
+        SetClipboardText('^('+search_string+')')
+        CloseClipboard()
 
     def _destroy_tooltip_and_clear_highlights(self, _) -> None:
         if self._tooltip_window is not None:
@@ -459,6 +496,7 @@ class Settings:
         self._root = root
         self._items_map = items_map
         self._image_scanner = image_scanner
+        self._window = None
 
         self._config = ConfigParser()
         self._config_file = 'settings.ini'
@@ -477,9 +515,13 @@ class Settings:
         self._display_inventory_items = True if b is not None and b == 'True' else False
         b = s.get('display_unavailable_recipes')
         self._display_unavailable_recipes = True if b is not None and b == 'True' else False
+        b = s.get('copy_recipe_to_clipboard')
+        self._copy_recipe_to_clipboard = True if b is not None and b == 'True' else False
 
 
     def show(self) -> None:
+        if self._window is not None:
+            return
         self._window = tk.Toplevel()
 
         self._window.geometry('+100+200')
@@ -511,8 +553,15 @@ class Settings:
         if self._display_unavailable_recipes:
             c.select()
 
+        c = tk.Checkbutton(self._window, text='Copy recipe to clipboard', command=self._update_copy_recipe_to_clipboard)
+        c.grid(row=5, column=0, columnspan=2)
+        if self._copy_recipe_to_clipboard:
+            c.select()
+
     def _close(self) -> None:
-        self._window.destroy()
+        if self._window is not None:
+            self._window.destroy()
+        self._window = None
 
     def _save_config(self) -> None:
         self._config['settings']['scanner_window'] = str(self._image_scanner.scanner_window_size)
@@ -520,6 +569,7 @@ class Settings:
         self._config['settings']['confidence_threshold'] = str(self._image_scanner.confidence_threshold)
         self._config['settings']['display_inventory_items'] = str(self._display_inventory_items)
         self._config['settings']['display_unavailable_recipes'] = str(self._display_unavailable_recipes)
+        self._config['settings']['copy_recipe_to_clipboard'] = str(self._copy_recipe_to_clipboard)
         with open(self._config_file, 'w') as f:
             self._config.write(f)
 
@@ -562,15 +612,33 @@ class Settings:
         self._display_unavailable_recipes = not self._display_unavailable_recipes
         self._save_config()
 
+    def _update_copy_recipe_to_clipboard(self) -> None:
+        self._copy_recipe_to_clipboard = not self._copy_recipe_to_clipboard
+        self._save_config()
+
     def should_display_inventory_items(self) -> bool:
         return self._display_inventory_items
 
     def should_display_unavailable_recipes(self) -> bool:
         return self._display_unavailable_recipes
 
+    def should_copy_recipe_to_clipboard(self) -> bool:
+        return self._copy_recipe_to_clipboard
+
+def show_warning(text: str) -> None:
+    messagebox.showwarning('poe-archnemesis-scanner', text)
+
+def show_error_and_die(text: str) -> None:
+    # Dealing with inconveniences as Perl would
+    messagebox.showerror('poe-archnemesis-scanner', text)
+    sys.exit()
+
 def get_poe_window_info() -> PoeWindowInfo:
     info = PoeWindowInfo()
     hwnd = win32gui.FindWindow(None, 'Path of Exile')
+    if hwnd == 0:
+        show_error_and_die('Path of Exile is not running.')
+
     x0, y0, x1, y1 = win32gui.GetWindowRect(hwnd)
     info.x = x0
     info.y = y0
@@ -579,6 +647,14 @@ def get_poe_window_info() -> PoeWindowInfo:
     x0, y0, x1, y1 = win32gui.GetClientRect(hwnd)
     info.client_width = x1 - x0
     info.client_height = y1 - y0
+
+    if info.client_width == 0 or info.client_height == 0:
+        show_warning("Unable to detect Path of Exile resolution. Make sure it isn't running in the Fullscreen mode.\n\nThe tool will use your screen resolution for calculations instead.")
+        screen = ImageGrab.grab()
+        info.x = 0
+        info.y = 0
+        info.width, info.height = screen.size
+        info.client_width, info.client_height = screen.size
     info.title_bar_height = info.height - info.client_height
     return info
 
@@ -599,6 +675,7 @@ def calculate_default_scale(info: PoeWindowInfo) -> float:
 
 # Create root as early as possible to initialize some modules (e.g. ImageTk)
 root = tk.Tk()
+root.withdraw()
 
 info = get_poe_window_info()
 
